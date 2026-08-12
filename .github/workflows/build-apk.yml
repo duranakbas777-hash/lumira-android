@@ -11,7 +11,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -25,29 +25,16 @@ jobs:
           cat ci/payload/part*.b64 | tr -d '\r\n' | base64 --decode > /tmp/lumira-native.zip
           unzip -t /tmp/lumira-native.zip
           unzip -q -o /tmp/lumira-native.zip -d .
-          test -f settings.gradle.kts -o -f settings.gradle
-          test -f app/build.gradle.kts -o -f app/build.gradle
+          test -f app/build.gradle.kts
+          test -f app/src/main/AndroidManifest.xml
 
-      - name: Pin supported Android toolchain
+      - name: Apply startup crash hotfix
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('gradle/libs.versions.toml')
-          s = p.read_text()
-          s = s.replace('agp = "9.4.0"', 'agp = "8.13.2"')
-          s = s.replace('androidGradlePlugin = "9.4.0"', 'androidGradlePlugin = "8.13.2"')
-          p.write_text(s)
-          for name in ('app/build.gradle.kts','app/build.gradle'):
-              f = Path(name)
-              if not f.exists():
-                  continue
-              t = f.read_text()
-              t = t.replace('compileSdk = 37','compileSdk = 36').replace('compileSdk 37','compileSdk 36')
-              t = t.replace('targetSdk = 37','targetSdk = 36').replace('targetSdk 37','targetSdk 36')
-              f.write_text(t)
-          PY
+          patch -p1 < ci/startup-hotfix.patch
+          grep -n 'versionName' app/build.gradle.kts
+          grep -n 'agp =' gradle/libs.versions.toml
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -72,9 +59,10 @@ jobs:
           if [ -f ci/lumi-mark.b64 ]; then
             mkdir -p app/src/main/res/drawable-nodpi
             base64 --decode ci/lumi-mark.b64 > app/src/main/res/drawable-nodpi/lumira_lumi_mark.png
+            file app/src/main/res/drawable-nodpi/lumira_lumi_mark.png
           fi
 
-      - name: Verify no WebView source
+      - name: Verify native-only source
         shell: bash
         run: |
           if grep -R -n -E 'android\.webkit|\bWebView\b|loadUrl\(|addJavascriptInterface\(' app/src/main --include='*.kt' --include='*.java'; then
@@ -88,21 +76,54 @@ jobs:
           set -euo pipefail
           gradle --no-daemon clean assembleDebug --stacktrace
 
+      - name: Launch smoke test on Android emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          disable-animations: true
+          script: |
+            set -euo pipefail
+            APK="$(find app/build/outputs/apk/debug -type f -name '*.apk' | head -n1)"
+            test -n "$APK"
+            adb install -r "$APK"
+            adb logcat -c
+            adb shell am force-stop watch.lumira.app
+            adb shell am start -W -n watch.lumira.app/.MainActivity
+            sleep 8
+            PID="$(adb shell pidof watch.lumira.app | tr -d '\r')"
+            if [ -z "$PID" ]; then
+              adb logcat -d > startup-log.txt
+              grep -A80 -B20 -E 'FATAL EXCEPTION|AndroidRuntime|Process: watch\.lumira\.app' startup-log.txt || true
+              echo 'Lumira process died during startup smoke test.' >&2
+              exit 1
+            fi
+            adb logcat -d > startup-log.txt
+            if grep -A80 -B20 -E 'FATAL EXCEPTION.*main|Process: watch\.lumira\.app' startup-log.txt | grep -q 'watch\.lumira\.app'; then
+              grep -A80 -B20 -E 'FATAL EXCEPTION|AndroidRuntime|Process: watch\.lumira\.app' startup-log.txt || true
+              echo 'Lumira emitted a fatal startup exception.' >&2
+              exit 1
+            fi
+            adb shell dumpsys activity activities | grep -E 'watch\.lumira\.app' | head -20 || true
+            echo "Lumira startup smoke test passed with PID $PID"
+
       - name: Collect APK
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p out
           APK="$(find app/build/outputs/apk/debug -type f -name '*.apk' | head -n1)"
-          test -n "$APK"
-          cp "$APK" out/Lumira-Native-v2.0.0-alpha1.apk
-          sha256sum out/Lumira-Native-v2.0.0-alpha1.apk | tee out/SHA256.txt
+          cp "$APK" out/Lumira-Native-v2.0.0-alpha2.apk
+          sha256sum out/Lumira-Native-v2.0.0-alpha2.apk | tee out/SHA256.txt
+          cp startup-log.txt out/startup-log.txt 2>/dev/null || true
           ls -lh out/
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: lumira-native-apk
+          name: lumira-native-alpha2-tested
           path: out/
           if-no-files-found: error
           retention-days: 14
