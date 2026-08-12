@@ -1,0 +1,160 @@
+diff -ruN '--exclude=build' '--exclude=.gradle' a/app/build.gradle.kts b/app/build.gradle.kts
+--- a/app/build.gradle.kts	2026-08-12 19:35:23.000000000 +0000
++++ b/app/build.gradle.kts	2026-08-12 21:52:01.457768464 +0000
+@@ -5,14 +5,14 @@
+ 
+ android {
+     namespace = "watch.lumira.app"
+-    compileSdk = 37
++    compileSdk = 36
+ 
+     defaultConfig {
+         applicationId = "watch.lumira.app"
+         minSdk = 24
+-        targetSdk = 37
+-        versionCode = 20001
+-        versionName = "2.0.0-alpha1"
++        targetSdk = 36
++        versionCode = 20002
++        versionName = "2.0.0-alpha2"
+ 
+         buildConfigField("String", "LUMIRA_API_BASE_URL", "\"https://lumira.watch/wp-json/lumira-app/v1/\"")
+         buildConfigField("String", "LUMIRA_SITE_URL", "\"https://lumira.watch/\"")
+diff -ruN '--exclude=build' '--exclude=.gradle' a/app/src/main/java/watch/lumira/app/LumiraApplication.kt b/app/src/main/java/watch/lumira/app/LumiraApplication.kt
+--- a/app/src/main/java/watch/lumira/app/LumiraApplication.kt	2026-08-12 19:26:57.000000000 +0000
++++ b/app/src/main/java/watch/lumira/app/LumiraApplication.kt	2026-08-12 21:52:00.896931757 +0000
+@@ -6,18 +6,22 @@
+ import watch.lumira.app.core.image.LumiraImageLoader
+ import watch.lumira.app.core.session.SecureTokenStore
+ 
++/**
++ * Keep process startup deliberately lightweight. Some Android vendors are very
++ * aggressive during cold start; touching keystore, cache directories or system
++ * services from Application.onCreate can turn a recoverable feature failure
++ * into an immediate app crash.
++ */
+ class LumiraApplication : Application() {
+-    lateinit var repository: LumiraRepository
+-        private set
+-    lateinit var imageLoader: LumiraImageLoader
+-        private set
+-    lateinit var downloads: DownloadController
+-        private set
++    val repository: LumiraRepository by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
++        LumiraRepository(SecureTokenStore(applicationContext))
++    }
++
++    val imageLoader: LumiraImageLoader by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
++        LumiraImageLoader(applicationContext)
++    }
+ 
+-    override fun onCreate() {
+-        super.onCreate()
+-        repository = LumiraRepository(SecureTokenStore(this))
+-        imageLoader = LumiraImageLoader(this)
+-        downloads = DownloadController(this)
++    val downloads: DownloadController by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
++        DownloadController(applicationContext)
+     }
+ }
+diff -ruN '--exclude=build' '--exclude=.gradle' a/app/src/main/java/watch/lumira/app/MainActivity.kt b/app/src/main/java/watch/lumira/app/MainActivity.kt
+--- a/app/src/main/java/watch/lumira/app/MainActivity.kt	2026-08-12 19:33:45.000000000 +0000
++++ b/app/src/main/java/watch/lumira/app/MainActivity.kt	2026-08-12 21:52:00.895204007 +0000
+@@ -2,6 +2,9 @@
+ 
+ import android.content.Intent
+ import android.os.Bundle
++import android.view.Gravity
++import android.widget.LinearLayout
++import android.widget.TextView
+ import androidx.activity.ComponentActivity
+ import androidx.activity.compose.setContent
+ import androidx.compose.runtime.getValue
+@@ -16,16 +19,33 @@
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+         deepLinkPath = intent?.data?.encodedPath
+-        val app = application as LumiraApplication
+-        setContent {
+-            LumiraTheme {
+-                LumiraApp(
+-                    repository = app.repository,
+-                    imageLoader = app.imageLoader,
+-                    downloads = app.downloads,
+-                    initialPath = deepLinkPath,
+-                )
++
++        val app = application as? LumiraApplication
++        if (app == null) {
++            showStartupFallback("Lumira başlatılamadı. Uygulamayı kapatıp tekrar açmayı dene.")
++            return
++        }
++
++        val dependencies = runCatching {
++            StartupDependencies(app.repository, app.imageLoader, app.downloads)
++        }.getOrElse {
++            showStartupFallback("Lumira başlangıç bileşenleri hazırlanamadı. Uygulamayı tekrar açmayı dene.")
++            return
++        }
++
++        runCatching {
++            setContent {
++                LumiraTheme {
++                    LumiraApp(
++                        repository = dependencies.repository,
++                        imageLoader = dependencies.imageLoader,
++                        downloads = dependencies.downloads,
++                        initialPath = deepLinkPath,
++                    )
++                }
+             }
++        }.onFailure {
++            showStartupFallback("Lumira arayüzü başlatılamadı. Uygulamayı tekrar açmayı dene.")
+         }
+     }
+ 
+@@ -34,4 +54,34 @@
+         setIntent(intent)
+         deepLinkPath = intent.data?.encodedPath
+     }
++
++    private fun showStartupFallback(message: String) {
++        val density = resources.displayMetrics.density
++        val root = LinearLayout(this).apply {
++            orientation = LinearLayout.VERTICAL
++            gravity = Gravity.CENTER
++            setPadding((28 * density).toInt(), (28 * density).toInt(), (28 * density).toInt(), (28 * density).toInt())
++            setBackgroundColor(0xFF191817.toInt())
++        }
++        root.addView(TextView(this).apply {
++            text = "Lumira"
++            textSize = 28f
++            setTextColor(0xFFF0EDF1.toInt())
++            gravity = Gravity.CENTER
++        })
++        root.addView(TextView(this).apply {
++            text = message
++            textSize = 15f
++            setTextColor(0xFFD8D3D8.toInt())
++            gravity = Gravity.CENTER
++            setPadding(0, (14 * density).toInt(), 0, 0)
++        })
++        setContentView(root)
++    }
++
++    private data class StartupDependencies(
++        val repository: watch.lumira.app.core.data.LumiraRepository,
++        val imageLoader: watch.lumira.app.core.image.LumiraImageLoader,
++        val downloads: watch.lumira.app.core.download.DownloadController,
++    )
+ }
+diff -ruN '--exclude=build' '--exclude=.gradle' a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+--- a/gradle/libs.versions.toml	2026-08-12 20:27:28.000000000 +0000
++++ b/gradle/libs.versions.toml	2026-08-12 21:52:01.457949697 +0000
+@@ -1,5 +1,5 @@
+ [versions]
+-agp = "9.4.0"
++agp = "8.13.2"
+ kotlin = "2.3.21"
+ composeBom = "2026.06.01"
+ activityCompose = "1.13.0"
